@@ -1,0 +1,50 @@
+{
+  "name": "@savagelands-net/pi-middle-click-paste",
+  "version": "0.1.0",
+  "description": "Pi extension that makes Linux middle-click primary-selection copy and paste work inside Pi's fullscreen terminal",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "linux",
+    "middle-click",
+    "primary-selection",
+    "clipboard",
+    "wayland",
+    "x11"
+  ],
+  "license": "MIT",
+  "author": "savagelands-net",
+  "homepage": "https://github.com/savagelands-net/pi-middle-click-paste#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/savagelands-net/pi-middle-click-paste.git"
+  },
+  "bugs": {
+    "url": "https://github.com/savagelands-net/pi-middle-click-paste/issues"
+  },
+  "files": [
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}
