@@ -12,6 +12,10 @@ import {
 } from "../src/primary-clipboard.ts";
 import type { PointerEventLike } from "../src/pointer-event.ts";
 
+const NO_BACKEND_MESSAGE = `middle-click paste: ${NO_BACKEND_ERROR}`;
+const UNSUPPORTED_COPY_OUT =
+  "copy-out is unavailable: this Pi version does not expose transcript selection. Middle-click paste still works";
+
 /** In-memory stand-in for the desktop primary selection. */
 class FakeClipboard implements PrimarySelection {
   owned: string | undefined;
@@ -20,6 +24,8 @@ class FakeClipboard implements PrimarySelection {
   writeFails = false;
   reads = 0;
   writes = 0;
+  /** Set when another application owns the selection, i.e. what we paste. */
+  external: string | undefined;
 
   available(): boolean {
     return this.hasBackend;
@@ -29,13 +35,20 @@ class FakeClipboard implements PrimarySelection {
     return this.hasBackend ? { paste: "fake-paste", copy: "fake-copy" } : undefined;
   }
 
+  /** Pretend another application just took ownership of the selection. */
+  selectOwned(): void {
+    this.external = this.owned ?? "from the desktop";
+    this.owned = undefined;
+  }
+
   async read(): Promise<PrimaryRead> {
     this.reads += 1;
     if (this.readFails || !this.hasBackend) {
       return { status: "unavailable", error: NO_BACKEND_ERROR };
     }
-    if (this.owned === undefined) return { status: "empty", backend: "fake-paste" };
-    return { status: "text", text: this.owned, backend: "fake-paste" };
+    const text = this.owned ?? this.external;
+    if (text === undefined) return { status: "empty", backend: "fake-paste" };
+    return { status: "text", text, backend: "fake-paste" };
   }
 
   async write(text: string): Promise<PrimaryWrite> {
@@ -52,17 +65,22 @@ class FakeClipboard implements PrimarySelection {
 interface FakeUi extends ExtensionUi {
   notices: Array<{ message: string; level: string | undefined }>;
   pasted: string[];
+  refreshes: number;
 }
 
 function createUi(): FakeUi {
   return {
     notices: [],
     pasted: [],
+    refreshes: 0,
     notify(message: string, level?: "info" | "warning" | "error") {
       this.notices.push({ message, level });
     },
     pasteToEditor(text: string) {
       this.pasted.push(text);
+    },
+    refreshView() {
+      this.refreshes += 1;
     },
   };
 }
@@ -93,13 +111,33 @@ function sgr(button: number, x: number, y: number, release = false): string {
 /** A middle-button press in the editor area. */
 const MIDDLE_PRESS = sgr(1, 4, 2);
 
+/** Stdin stand-in that can be clicked on demand instead of hand-writing bytes. */
+class FakeStdin extends EventEmitter implements MouseInputStream {
+  middleClicks = 0;
+
+  override on(event: "data", listener: (chunk: string | Buffer) => void): this {
+    if (event === "data") this.middleClicks += 1;
+    return super.on(event, listener);
+  }
+
+  override removeListener(event: "data", listener: (chunk: string | Buffer) => void): this {
+    if (event === "data") this.middleClicks -= 1;
+    return super.removeListener(event, listener);
+  }
+
+  /** One registered listener means exactly one paste per click. */
+  click(): void {
+    this.emit("data", MIDDLE_PRESS);
+  }
+}
+
 function releaseEvent(button = 0): PointerEventLike {
   return { button, x: 1, y: 1, release: true };
 }
 
-function createController(clipboard = new FakeClipboard(), stdin = new EventEmitter()) {
+function createController(clipboard = new FakeClipboard(), stdin = new FakeStdin()) {
   const controller = new MiddleClickPasteController({ clipboard, stdin, testSettleMs: 0 });
-  return { controller, clipboard, stdin: stdin as EventEmitter & MouseInputStream };
+  return { controller, clipboard, stdin };
 }
 
 describe("middle-click paste", () => {
@@ -333,24 +371,136 @@ describe("/mcpaste", () => {
 });
 
 describe("attach lifecycle", () => {
-  it("replaces the previous session's wiring on re-attach", async () => {
+  it("repaints after a paste so the text appears without a key press", async () => {
     const { controller, clipboard, stdin } = createController();
+    const ui = createUi();
+    clipboard.selectOwned();
+    controller.attach(ui, createTui());
+
+    stdin.click();
+    await vi.waitFor(() => expect(ui.pasted).toEqual(["from the desktop"]));
+
+    expect(ui.refreshes).toBe(1);
+    controller.detach();
+  });
+
+  it("does not repaint when there is nothing to paste", async () => {
+    const { controller, stdin } = createController();
+    const ui = createUi();
+    controller.attach(ui, createTui());
+
+    stdin.click();
+    await vi.waitFor(() => expect(ui.notices.length).toBe(1));
+
+    expect(ui.pasted).toEqual([]);
+    expect(ui.refreshes).toBe(0);
+    controller.detach();
+  });
+
+  it("pastes once per click while one session is wired", async () => {
+    const { controller, clipboard, stdin } = createController();
+    const ui = createUi();
+    clipboard.selectOwned();
+    controller.attach(ui, createTui());
+
+    stdin.click();
+    await vi.waitFor(() => expect(ui.pasted).toEqual(["from the desktop"]));
+
+    expect(stdin.middleClicks).toBe(1);
+    controller.detach();
+    expect(stdin.middleClicks).toBe(0);
+  });
+
+  it("replaces the previous session's wiring on re-attach", async () => {
+    const { controller, clipboard } = createController();
     const first = createUi();
     const second = createUi();
     const firstTui = createTui();
     const secondTui = createTui();
+    const originalFirst = firstTui.handleSelectionMouseEvent;
 
     controller.attach(first, firstTui);
     controller.attach(second, secondTui);
-    clipboard.owned = "text";
+    clipboard.selectOwned();
 
-    stdin.emit("data", MIDDLE_PRESS);
-    await vi.waitFor(() => expect(second.pasted).toEqual(["text"]));
+    await controller.pastePrimary();
+
     expect(first.pasted).toEqual([]);
+    expect(second.pasted).toEqual(["from the desktop"]);
+    expect(controller.statusLine()).toContain("fake-paste");
 
-    secondTui.handleSelectionMouseEvent(releaseEvent());
-    expect(firstTui.handleSelectionMouseEvent).not.toBe(secondTui.handleSelectionMouseEvent);
+    // The replaced session gets its own handler back, so nothing can reach the
+    // stale UI through it.
+    expect(firstTui.handleSelectionMouseEvent).toBe(originalFirst);
+    firstTui.handleSelectionMouseEvent(releaseEvent());
+    expect(first.notices).toEqual([]);
 
+    controller.detach();
+  });
+
+  it("reports copy-out health in the status line", async () => {
+    const { controller, clipboard } = createController();
+    const ui = createUi();
+    const tui = createTui("selected in pi");
+    clipboard.writeFails = true;
+
+    controller.attach(ui, tui);
+
+    // Nothing attempted yet, so status makes no claim about copy-out.
+    expect(controller.statusLine()).not.toContain("copy-out");
+
+    tui.handleSelectionMouseEvent(releaseEvent());
+    await vi.waitFor(() => expect(ui.notices.length).toBe(1));
+    expect(ui.notices[0]?.message).toContain("copy-out failed");
+    expect(controller.statusLine()).toContain("copy-out failing");
+
+    clipboard.writeFails = false;
+    tui.handleSelectionMouseEvent(releaseEvent());
+    await vi.waitFor(() => expect(controller.statusLine()).not.toContain("copy-out failing"));
+    expect(controller.statusLine()).toContain("copy: fake-copy");
+
+    // A later transient failure is quiet, but still shows up in status.
+    clipboard.writeFails = true;
+    ui.notices.length = 0;
+    tui.handleSelectionMouseEvent(releaseEvent());
+    await vi.waitFor(() => expect(controller.statusLine()).toContain("copy-out failing"));
+    expect(ui.notices).toEqual([]);
+
+    controller.detach();
+  });
+
+  it("says so once when this Pi build has no selection hook", async () => {
+    const { controller } = createController();
+    const ui = createUi();
+
+    controller.attach(ui, {});
+
+    expect(ui.notices.map((notice) => notice.message)).toEqual([UNSUPPORTED_COPY_OUT]);
+    expect(controller.statusLine()).toContain("copy-out unsupported");
+
+    controller.detach();
+    expect(controller.statusLine()).not.toContain("copy-out");
+  });
+
+  it("does not call the tooling broken when the selection is merely empty", async () => {
+    const { controller, clipboard } = createController();
+    const ui = createUi();
+    clipboard.hasBackend = false;
+    controller.attach(ui, createTui());
+
+    await controller.pastePrimary();
+    expect(ui.notices.map((notice) => notice.message)).toEqual([NO_BACKEND_MESSAGE]);
+
+    clipboard.hasBackend = true;
+    ui.notices.length = 0;
+
+    await controller.pastePrimary();
+    clipboard.hasBackend = false;
+    await controller.pastePrimary();
+
+    expect(ui.notices.map((notice) => notice.message)).toEqual([
+      "primary selection is empty: select some text first",
+    ]);
     controller.detach();
   });
 

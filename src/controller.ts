@@ -19,9 +19,18 @@ import { mirrorSelectionOnRelease, type SelectionMirrorHandle } from "./selectio
 export interface ExtensionUi {
   notify(message: string, level?: "info" | "warning" | "error"): void;
   pasteToEditor(text: string): void;
+  /**
+   * Repaint the terminal.
+   *
+   * Pi renders as part of handling its own input, so text injected from an
+   * async callback stays in the editor buffer, invisible, until the next key
+   * press forces a frame.
+   */
+  refreshView(): void;
 }
 
 export interface ControllerOptions {
+  /** Test seam; production drives the real desktop primary selection. */
   clipboard?: PrimarySelection | undefined;
   /** Defaults to `process.stdin`; injectable for tests. */
   stdin?: MouseInputStream | undefined;
@@ -32,6 +41,16 @@ export interface ControllerOptions {
 const USAGE = "usage: /mcpaste [status|on|off|test]";
 const UNSUPPORTED_COPY_OUT =
   "copy-out is unavailable: this Pi version does not expose transcript selection. Middle-click paste still works";
+
+type CopyOutHealth = "unknown" | "ok" | "missing" | "failing";
+
+/** What `/mcpaste status` appends for each copy-out state. */
+const COPY_OUT_STATUS: Record<CopyOutHealth, string> = {
+  unknown: "",
+  ok: "",
+  missing: " (copy-out unsupported)",
+  failing: " (copy-out failing)",
+};
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -53,11 +72,15 @@ export class MiddleClickPasteController {
   private ui: ExtensionUi | undefined;
   private mirror: SelectionMirrorHandle | undefined;
   private disposeWatch: (() => void) | undefined;
+  /** What the last copy-out attempt told us, for status reporting. */
+  private copyOut: CopyOutHealth = "unknown";
   private enabled = true;
-  private pasteInFlight = false;
+  /** Bumped on every teardown so in-flight clipboard reads cannot paste late. */
+  private generation = 0;
 
   constructor(options: ControllerOptions = {}) {
     this.clipboard = options.clipboard ?? new PrimaryClipboard();
+    this.stdin = options.stdin;
     this.stdin = options.stdin;
     this.testSettleMs = options.testSettleMs ?? 50;
   }
@@ -70,28 +93,41 @@ export class MiddleClickPasteController {
     const state = this.enabled ? "on" : "off";
     const backends = this.clipboard.describe();
     if (!backends) return `middle-click paste: ${state} - ${NO_BACKEND_ERROR}`;
-    const copyOut = this.enabled && this.mirror && !this.mirror.supported ? " (copy-out unsupported)" : "";
-    return `middle-click paste: ${state} · paste: ${backends.paste} · copy: ${backends.copy}${copyOut}`;
+    const broken = COPY_OUT_STATUS[this.copyOut];
+    return `middle-click paste: ${state} · paste: ${backends.paste} · copy: ${backends.copy}${broken}`;
   }
 
   /**
-   * Start watching for middle-clicks and mirroring selections. Safe to call again
-   * on every session start: the previous wiring is torn down first.
+   * Start watching for middle-clicks and mirroring selections. Safe to call on
+   * every session start: the previous wiring is torn down first, so a session
+   * reload cannot stack watchers or selection handlers.
    */
   attach(ui: ExtensionUi, tuiPrototype: unknown): void {
     this.detach();
     if (!this.enabled) return;
     this.ui = ui;
+    this.copyOut = "unknown";
 
-    this.mirror = mirrorSelectionOnRelease(tuiPrototype, {
-      onSelection: (text) => {
-        void this.mirrorSelection(text);
-      },
-      onError: (error) => {
-        this.warnOnce("mirror", ui, `copy-out failed: ${describeError(error)}`);
-      },
-    });
-    if (!this.mirror.supported) this.warnOnce("unsupported", ui, UNSUPPORTED_COPY_OUT);
+    // Mirror the selection first: a session restored with text still selected
+    // should reach the primary selection even without a new mouse release.
+    try {
+      this.mirror = mirrorSelectionOnRelease(tuiPrototype, {
+        onSelection: (text) => {
+          void this.mirrorSelection(text);
+        },
+        onError: (error) => {
+          this.warnOnce("mirror", ui, `copy-out failed: ${describeError(error)}`);
+        },
+      });
+      if (!this.mirror.supported) {
+        this.copyOut = "missing";
+        this.warnOnce("unsupported", ui, UNSUPPORTED_COPY_OUT);
+      }
+    } catch (error) {
+      this.mirror = undefined;
+      this.copyOut = "missing";
+      this.warnOnce("unsupported", ui, `${UNSUPPORTED_COPY_OUT} (${describeError(error)})`);
+    }
 
     this.disposeWatch = watchMiddleClick({
       stdin: this.stdin,
@@ -102,11 +138,13 @@ export class MiddleClickPasteController {
   }
 
   detach(): void {
+    this.generation += 1;
     this.disposeWatch?.();
     this.disposeWatch = undefined;
     this.mirror?.restore();
     this.mirror = undefined;
     this.ui = undefined;
+    this.copyOut = "unknown";
   }
 
   setEnabled(enabled: boolean, ui: ExtensionUi, tuiPrototype: unknown): void {
@@ -144,33 +182,37 @@ export class MiddleClickPasteController {
     ui.notify(USAGE, "error");
   }
 
-  /** Read the primary selection and drop it into the editor like a middle-click. */
+  /** Read the primary selection and drop it into the editor like a real middle-click would. */
   async pastePrimary(): Promise<void> {
-    if (this.pasteInFlight) return;
-    this.pasteInFlight = true;
-    try {
-      const ui = this.ui;
-      if (!ui) return;
-      const result: PrimaryRead = await this.clipboard.read();
-      if (result.status === "text") {
-        ui.pasteToEditor(result.text);
-        return;
-      }
-      if (result.status === "empty") {
-        this.warnOnce("empty", ui, "primary selection is empty: select some text first");
-        return;
-      }
-      this.warnOnce("read", ui, `middle-click paste: ${result.error}`);
-    } finally {
-      this.pasteInFlight = false;
+    const ui = this.ui;
+    if (!ui) return;
+    const generation = this.generation;
+    const result: PrimaryRead = await this.clipboard.read();
+    // A pending click must not paste into a torn-down or replaced session.
+    if (generation !== this.generation) return;
+    if (result.status === "text") {
+      this.warned.delete("read");
+      ui.pasteToEditor(result.text);
+      ui.refreshView();
+      return;
     }
+    if (result.status === "empty") {
+      // Nothing selected explains the failed read on its own when there is no
+      // tool to tell the two apart, so never also claim the tooling is broken.
+      this.warned.add("read");
+      this.warnOnce("empty", ui, "primary selection is empty: select some text first");
+      return;
+    }
+    this.warnOnce("read", ui, `middle-click paste: ${result.error}`);
   }
 
   /** Publish a finished selection as the primary selection, without any notice. */
   async mirrorSelection(text: string): Promise<void> {
     const result: PrimaryWrite = await this.clipboard.write(text);
-    if (result.status === "unavailable" && this.ui) {
-      this.warnOnce("write", this.ui, `copy-out failed: ${result.error}`);
+    this.copyOut = result.status === "unavailable" ? "failing" : "ok";
+    if (result.status === "unavailable") {
+      const ui = this.ui;
+      if (ui) this.warnOnce("write", ui, `copy-out failed: ${result.error}`);
     }
   }
 
@@ -197,7 +239,10 @@ export class MiddleClickPasteController {
       return;
     }
     const seen = read.status === "text" ? "different text" : read.status;
-    ui.notify(`middle-click paste test: wrote the primary selection but could not read it back (${seen})`, "warning");
+    ui.notify(
+      `middle-click paste test: wrote the primary selection but could not read it back (${seen})`,
+      "warning",
+    );
   }
 
   private warnOnce(kind: string, ui: ExtensionUi | undefined, message: string): void {

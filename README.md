@@ -62,10 +62,11 @@ Problems are reported once per session, so a missing tool does not repeat itself
 
 **Selection out, mirror.** `handleSelectionMouseEvent` on `TuiAltScreen.prototype` (the fullscreen TUI class from `@earendil-works/pi-tui`) is wrapped so that after Pi finishes handling a drag release, `getActiveSelectionText()` is read and published with `wl-copy --primary`, `xclip -selection primary`, or `xsel --primary --input`. Nothing about Pi's behaviour changes: copy-on-select still fills the regular clipboard, `ctrl+shift+c` still works, and the wrapper is removed again by `/mcpaste off` and on session shutdown. Selecting in Pi does not touch the Ctrl+C clipboard.
 
-Two details that matter on a real desktop:
+Three details that matter on a real desktop:
 
 - the clipboard tools are spawned detached, in their own process group, and are resolved as soon as the tool exits - they fork a background owner that inherits the descriptors, so waiting for the pipes to close would stall every copy and a `Ctrl+C` in Pi's terminal would kill the new selection owner
 - a selection nobody owns cannot block forever: every clipboard command runs under a timeout, and a tool that fails once is skipped on later clicks
+- Pi paints a frame as part of handling its own input, so text injected from a clipboard callback would sit in the editor buffer until the next key press. After a paste the extension borrows the TUI through `ctx.ui.custom()` and asks for a frame, so the text is on screen in the same instant as the click
 
 ## Notes and limits
 
