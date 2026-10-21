@@ -16,11 +16,23 @@ This extension supplies both halves: a middle-click that reaches Pi becomes a pr
 
 ## Install
 
+From npm:
+
+```bash
+pi install npm:@savagelands-net/pi-middle-click-paste
+```
+
+Or straight from the repository:
+
 ```bash
 pi install git:github.com/savagelands-net/pi-middle-click-paste
 ```
 
-Then restart Pi or run `/reload`.
+Then restart Pi or run `/reload`. To try it for a single run without installing:
+
+```bash
+pi -e npm:@savagelands-net/pi-middle-click-paste
+```
 
 ## Requirements
 
