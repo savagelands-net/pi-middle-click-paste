@@ -1,0 +1,87 @@
+# Publish to npm with OIDC trusted publishing: no stored token, no OTP prompt,
+# and every version gets signed build provenance attesting to this commit.
+#
+# One-time setup per package on npmjs.com: open the package → Publishing →
+# "Trusted publisher" → GitHub Actions, and set:
+#
+#   Owner name:    savagelands-net
+#   Repository:    <this repository name>
+#   Workflow name: npm-publish.yml
+#   Git tag:       (leave empty — publishing is driven by `main` releases)
+#
+# Then to ship: bump version in package.json, merge to main, and cut a release
+# whose tag matches that version:
+#
+#   gh release create v0.1.1 --generate-notes
+#
+# `workflow_dispatch` publishes whatever version package.json holds, for when a
+# release was cut before this workflow existed.
+name: npm-publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# `id-token` mints the OIDC token npm verifies; nothing else is writable.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository_owner == 'savagelands-net'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run --if-present typecheck
+      - run: npm test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Trusted publishing needs npm >= 11.5.1; runners ship older.
+      - run: npm install -g npm@latest
+      - run: npm ci
+
+      - name: Release tag must match package.json version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          if [ -z "${TAG}" ]; then
+            echo "Manual dispatch: publishing ${version} from HEAD."
+            exit 0
+          fi
+          if [ "${TAG#v}" != "${version}" ]; then
+            echo "::error::tag ${TAG} != package.json version ${version}"
+            exit 1
+          fi
+          echo "Publishing ${version} (tag ${TAG})."
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          # Prereleases must not steal the `latest` tag.
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            dist_tag=next
+          else
+            dist_tag=latest
+          fi
+          npm publish --provenance --access public --tag "${dist_tag}"
