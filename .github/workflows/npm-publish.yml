@@ -106,10 +106,17 @@ jobs:
             dist_tag=latest
           fi
           publish_args=(--provenance --access public --tag "${dist_tag}")
-          if ! npm publish "${publish_args[@]}"; then
-            # npm's own message is a bare ENEEDAUTH; it hides the usual reason.
-            echo "::error::npm refused to publish. A plain ENEEDAUTH here"
-            echo "means this package has no trusted publisher for this"
-            echo "workflow yet: npmjs.com -> package -> Publishing."
-            exit 1
+          set +e
+          npm publish "${publish_args[@]}" 2>&1 | tee /tmp/publish.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            # npm hides a rejected OIDC exchange behind a bare ENEEDAUTH;
+            # only blame the trusted publisher when that is what happened.
+            if grep -q ENEEDAUTH /tmp/publish.log; then
+              echo "::error::npm had no credentials: this package needs a"
+              echo "trusted publisher for this workflow (npmjs.com ->"
+              echo "package -> Publishing -> Trusted publisher)."
+            fi
+            exit "$status"
           fi
