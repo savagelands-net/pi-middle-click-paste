@@ -57,6 +57,27 @@ jobs:
           cache: npm
       # Trusted publishing needs npm >= 11.5.1; runners ship older.
       - run: npm install -g npm@latest
+
+      # npm's own failure here is a confusing ENEEDAUTH, so say the real
+      # reason instead: no OIDC token for npm to trade in.
+      - name: Preflight (OIDC + npm version)
+        run: |
+          set -euo pipefail
+          echo "node $(node --version) / npm $(npm --version)"
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::No OIDC token available to this job."
+            echo "Needs id-token: write AND OpenID Connect enabled in"
+            echo "Settings -> Actions -> General -> Workflow permissions."
+            exit 1
+          fi
+          echo "OIDC token request endpoint is available."
+          oldest=$(printf '%s\n' 11.5.1 "$(npm --version)" | sort -V | head -1)
+          if [ "$oldest" != "11.5.1" ]; then
+            echo "::error::npm $(npm --version) is too old for provenance."
+            echo "Trusted publishing needs npm >= 11.5.1."
+            exit 1
+          fi
+
       - run: npm ci
 
       - name: Release tag must match package.json version
@@ -84,4 +105,11 @@ jobs:
           else
             dist_tag=latest
           fi
-          npm publish --provenance --access public --tag "${dist_tag}"
+          publish_args=(--provenance --access public --tag "${dist_tag}")
+          if ! npm publish "${publish_args[@]}"; then
+            # npm's own message is a bare ENEEDAUTH; it hides the usual reason.
+            echo "::error::npm refused to publish. A plain ENEEDAUTH here"
+            echo "means this package has no trusted publisher for this"
+            echo "workflow yet: npmjs.com -> package -> Publishing."
+            exit 1
+          fi
